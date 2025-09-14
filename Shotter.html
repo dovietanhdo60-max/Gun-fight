@@ -1,0 +1,599 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>2D Shooter — Demo</title>
+<style>
+  html,body{height:100%;margin:0;background:#000;color:#fff;font-family:Inter,system-ui,Arial;}
+  canvas{display:block;background:#000;width:100%;height:100%;}
+  #ui { position: fixed; left: 8px; top: 8px; z-index: 50; color:#fff; font-size:16px; text-shadow:0 1px 0 #000; }
+  #hint { position:fixed; left:0; right:0; bottom:24px; text-align:center; color:#bbb; font-size:13px; }
+  /* small helper to show mobile controls region */
+  .btn { position: fixed; z-index:50; border-radius:50%; display:flex; align-items:center; justify-content:center; color:#fff; font-weight:700; }
+  #btn-fire { width:88px; height:88px; right:18px; bottom:38px; background:#b32; box-shadow:0 6px 12px rgba(0,0,0,.6);}
+  #btn-skill { width:88px; height:88px; right:118px; bottom:38px; background:#246; box-shadow:0 6px 12px rgba(0,0,0,.6);}
+  #joystick { left:18px; bottom:18px; width:160px; height:160px; border-radius:50%; background:rgba(255,255,255,.06); box-shadow:inset 0 8px 30px rgba(0,0,0,.6); position:fixed; z-index:50; display:flex; align-items:center; justify-content:center; }
+  #stick { width:64px; height:64px; border-radius:50%; background:rgba(0,200,180,.9); }
+  #hpbar { width:200px; height:14px; background:rgba(255,255,255,.06); border-radius:6px; overflow:hidden; margin-top:6px; }
+  #hpbar > i { display:block; height:100%; background:linear-gradient(90deg,#2ecc71,#27ae60); width:100%; }
+  .pickup { position:absolute; z-index:40; pointer-events:none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+
+<div id="ui">
+  <div id="stats">
+    Score: <span id="score">0</span> &nbsp; Kills:<span id="kills">0</span><br/>
+    Energy:<span id="energy">0</span>/<span id="maxEnergy">20</span><br/>
+    HP:<span id="hp">100</span><br/>
+    Bullets x<span id="bmul">1</span>
+    <div id="hpbar"><i id="hpfill" style="width:100%"></i></div>
+  </div>
+</div>
+
+<div id="hint">Left joystick → di chuyển • Nút đỏ → bắn • Nút xanh → kỹ năng khi đầy năng lượng</div>
+
+<!-- Controls -->
+<div id="joystick"><div id="stick"></div></div>
+<div id="btn-skill" class="btn">★</div>
+<div id="btn-fire" class="btn">●</div>
+
+<script>
+/* ----------------------------
+   2D SHOOTER — single file
+   - Save as index.html and open in browser
+   - Touch controls + mouse supported
+   ---------------------------- */
+(() => {
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('2d', { alpha:true });
+  let W = canvas.width = innerWidth;
+  let H = canvas.height = innerHeight;
+  window.addEventListener('resize', ()=>{ W = canvas.width = innerWidth; H = canvas.height = innerHeight; });
+
+  // UI elements
+  const elScore = document.getElementById('score');
+  const elKills = document.getElementById('kills');
+  const elEnergy = document.getElementById('energy');
+  const elMaxEnergy = document.getElementById('maxEnergy');
+  const elHP = document.getElementById('hp');
+  const elBmul = document.getElementById('bmul');
+  const elHPFill = document.getElementById('hpfill');
+
+  // Difficulty from URL: easy|normal|hard|impossible OR numeric 1|2|4|10
+  const query = new URLSearchParams(location.search);
+  const diffParam = (query.get('diff') || 'normal').toLowerCase();
+  const diffMap = { easy:1, normal:2, hard:4, impossible:10 };
+  let difficulty = diffMap[diffParam] || parseFloat(diffParam) || 2;
+
+  // Game state
+  let score = 0, kills = 0;
+  let energy = 0, maxEnergy = 20;
+  let playerHP = 100, maxHP = 100;
+  let bulletsMultiplier = 1;
+  let killForDouble = 40; // every 40 kills bullets x2
+  let lastDoubleAt = 0;
+
+  elMaxEnergy.textContent = maxEnergy;
+  elBmul.textContent = bulletsMultiplier;
+
+  // Player
+  const player = {
+    x: W/2, y: H/2, size: 28, speed: 220, color: '#0ff',
+    vx:0, vy:0, alive: true
+  };
+
+  // Entities
+  let bullets = [];
+  let enemies = [];
+  let pickups = []; // heal items
+  let bosses = [];
+
+  // Timing & spawn
+  let lastSpawn = 0;
+  let spawnInterval = 900 / difficulty; // base spawn, faster with difficulty
+  let lastTime = performance.now();
+  const bulletSpeed = 700;
+  const enemySpeedBase = 50;
+  let killsSinceSkill = 0;
+
+  // Controls (joystick)
+  const joystick = document.getElementById('joystick');
+  const stick = document.getElementById('stick');
+  const btnFire = document.getElementById('btn-fire');
+  const btnSkill = document.getElementById('btn-skill');
+
+  let joystickBase = {
+    x: joystick.getBoundingClientRect().left + joystick.offsetWidth/2,
+    y: joystick.getBoundingClientRect().top + joystick.offsetHeight/2,
+    radius: joystick.offsetWidth/2 - 8
+  };
+  function recalcJoystick(){ const r = joystick.getBoundingClientRect(); joystickBase.x = r.left + r.width/2; joystickBase.y = r.top + r.height/2; joystickBase.radius = r.width/2 - 8; }
+  window.addEventListener('resize', recalcJoystick);
+  recalcJoystick();
+
+  // touch/mouse handling -- left side joystick
+  let pointerActive = false;
+  let pointerId = null;
+  let stickPos = { x: joystickBase.x, y: joystickBase.y }; // where stick is drawn
+  let moveDir = { x:0, y:0 };
+
+  function setStick(px, py){
+    const dx = px - joystickBase.x;
+    const dy = py - joystickBase.y;
+    const dist = Math.sqrt(dx*dx+dy*dy);
+    const max = joystickBase.radius;
+    const d = Math.min(dist, max);
+    const nx = dx/dist || 0;
+    const ny = dy/dist || 0;
+    stick.style.transform = `translate(${nx*d}px,${ny*d}px)`;
+    moveDir.x = (d? nx * (d/max) : 0);
+    moveDir.y = (d? ny * (d/max) : 0);
+  }
+  function resetStick(){
+    stick.style.transform = `translate(0px,0px)`;
+    moveDir.x = 0; moveDir.y = 0;
+  }
+
+  // listen for touches
+  function handleStart(e){
+    for(const t of (e.changedTouches || [e])){
+      const x = t.clientX, y = t.clientY;
+      // if touch inside joystick area -> bind joystick
+      const dx = x - joystickBase.x, dy = y - joystickBase.y;
+      if(Math.hypot(dx,dy) < joystickBase.radius + 60){
+        pointerActive = true; pointerId = t.identifier || 'm';
+        setStick(x,y);
+      } else {
+        // else if touch on right side we check UI buttons (handled separately)
+      }
+    }
+  }
+  function handleMove(e){
+    for(const t of (e.changedTouches || [e])){
+      if(pointerActive && (t.identifier===pointerId||pointerId==='m')){
+        setStick(t.clientX,t.clientY);
+      }
+    }
+  }
+  function handleEnd(e){
+    for(const t of (e.changedTouches || [e])){
+      if(pointerActive && (t.identifier===pointerId||pointerId==='m')){
+        pointerActive=false; pointerId=null; resetStick();
+      }
+    }
+  }
+  // mouse fallback
+  window.addEventListener('mousedown', handleStart);
+  window.addEventListener('mousemove', handleMove);
+  window.addEventListener('mouseup', handleEnd);
+  window.addEventListener('touchstart', handleStart);
+  window.addEventListener('touchmove', handleMove, {passive:false});
+  window.addEventListener('touchend', handleEnd);
+
+  // Fire button
+  let firing = false;
+  btnFire.addEventListener('touchstart', e => { e.preventDefault(); firing = true; });
+  btnFire.addEventListener('touchend', e => { e.preventDefault(); firing = false; });
+  btnFire.addEventListener('mousedown', e => { e.preventDefault(); firing = true; });
+  btnFire.addEventListener('mouseup', e => { e.preventDefault(); firing = false; });
+
+  // Skill
+  btnSkill.addEventListener('click', ()=>{
+    useSkill();
+  });
+  btnSkill.addEventListener('touchstart', e => { e.preventDefault(); useSkill(); });
+
+  // shooting logic
+  let lastShotTime = 0;
+  const fireRate = 170; // ms
+
+  function spawnEnemy(isBoss=false){
+    const r = 12 + (isBoss? 20 : Math.random()*10);
+    // spawn around edges
+    const edge = Math.floor(Math.random()*4);
+    let x,y;
+    if(edge===0){ x = -20; y = Math.random()*H; }
+    else if(edge===1){ x = W+20; y = Math.random()*H; }
+    else if(edge===2){ x = Math.random()*W; y = -20; }
+    else { x = Math.random()*W; y = H+20; }
+    const speed = enemySpeedBase + Math.random()*40 + (isBoss? 80 : 0);
+    enemies.push({
+      x,y, r, isBoss, hp: isBoss? 200 : 8 + Math.floor(Math.random()*8),
+      speed: speed * (1 + (difficulty-1)/2),
+      color: '#e22'
+    });
+  }
+
+  function spawnPickup(x,y){
+    pickups.push({ x, y, life: 10000, size: 14, value: 5, t: performance.now() });
+  }
+
+  function fireAt(x,y){
+    // create bullet(s) from player towards (x,y)
+    const now = performance.now();
+    if(now - lastShotTime < fireRate) return;
+    lastShotTime = now;
+    // aim to nearest enemy if exists (auto-aim)
+    const target = findNearestEnemy();
+    let ang;
+    if(target && Math.random()<0.85){ // 85% chance auto-aim
+      ang = Math.atan2(target.y - player.y, target.x - player.x);
+    } else {
+      ang = Math.atan2(y - player.y, x - player.x);
+    }
+    // create bulletsMultiplier bullets with small spread
+    const mul = bulletsMultiplier;
+    for(let i=0;i<mul;i++){
+      const spread = (i - (mul-1)/2) * ( (Math.PI/180) * 4 );
+      bullets.push({
+        x: player.x + Math.cos(ang)*(player.size+8),
+        y: player.y + Math.sin(ang)*(player.size+8),
+        vx: Math.cos(ang+spread)*bulletSpeed,
+        vy: Math.sin(ang+spread)*bulletSpeed,
+        life: 2000,
+        born: performance.now(),
+        color: '#0ff'
+      });
+    }
+  }
+
+  function findNearestEnemy(){
+    if(enemies.length===0 && bosses.length===0) return null;
+    let minD = Infinity, best = null;
+    for(const e of enemies) {
+      const dx = e.x - player.x, dy = e.y - player.y;
+      const d = dx*dx+dy*dy;
+      if(d < minD){ minD = d; best = e; }
+    }
+    for(const b of bosses) {
+      const dx = b.x - player.x, dy = b.y - player.y;
+      const d = dx*dx+dy*dy;
+      if(d < minD){ minD = d; best = b; }
+    }
+    return best;
+  }
+
+  // Skill: shoot 100 bullets in circle
+  function useSkill(){
+    if(energy < maxEnergy) return;
+    energy = 0; updateUI();
+    const n = 100;
+    for(let i=0;i<n;i++){
+      const ang = Math.PI*2*i/n;
+      bullets.push({
+        x: player.x, y: player.y,
+        vx: Math.cos(ang)*450, vy: Math.sin(ang)*450,
+        life: 3000, born: performance.now(), color: '#8ff'
+      });
+    }
+  }
+
+  // Game loop
+  function update(dt){
+    // movement
+    const speed = player.speed;
+    player.x += moveDir.x * speed * dt;
+    player.y += moveDir.y * speed * dt;
+    // clamp
+    player.x = Math.max(12, Math.min(W-12, player.x));
+    player.y = Math.max(12, Math.min(H-12, player.y));
+
+    // auto fire when pressing fire button
+    if(firing){
+      // aim towards pointer or nearest enemy; if no pointer, aim rightwards
+      let tx = player.x + (moveDir.x||1)*100;
+      let ty = player.y + (moveDir.y||0)*100;
+      const n = findNearestEnemy();
+      if(n) { tx = n.x; ty = n.y; }
+      fireAt(tx,ty);
+    }
+
+    // bullets move
+    const now = performance.now();
+    for(let i = bullets.length-1; i>=0; i--){
+      const b = bullets[i];
+      const life = now - b.born;
+      if(life > b.life){ bullets.splice(i,1); continue; }
+      b.x += b.vx * dt;
+      b.y += b.vy * dt;
+      // collision with enemies
+      // enemies
+      for(let j = enemies.length-1; j>=0; j--){
+        const e = enemies[j];
+        const dx = e.x - b.x, dy = e.y - b.y;
+        const dist = Math.hypot(dx,dy);
+        if(dist < e.r + 4){
+          // hit
+          e.hp -= 10;
+          if(e.hp <= 0){
+            enemies.splice(j,1);
+            onEnemyKilled(e);
+          }
+          // remove bullet
+          bullets.splice(i,1);
+          break;
+        }
+      }
+      if(!b) continue; // bullet removed
+      // bosses
+      for(let j = bosses.length-1; j>=0; j--){
+        const e = bosses[j];
+        const dx = e.x - b.x, dy = e.y - b.y;
+        const dist = Math.hypot(dx,dy);
+        if(dist < e.r + 4){
+          e.hp -= 10;
+          if(e.hp <= 0){
+            bosses.splice(j,1);
+            onBossKilled(e);
+          }
+          bullets.splice(i,1);
+          break;
+        }
+      }
+    }
+
+    // enemies AI move toward player
+    for(const e of enemies){
+      const dx = player.x - e.x, dy = player.y - e.y;
+      const d = Math.hypot(dx,dy) || 1;
+      const factor = (e.isBoss? 1.2 : 1);
+      e.x += (dx/d) * e.speed * dt * factor;
+      e.y += (dy/d) * e.speed * dt * factor;
+      // collision with player
+      const dist = Math.hypot(player.x - e.x, player.y - e.y);
+      if(dist < player.size/2 + e.r){
+        // damage player and destroy enemy
+        playerHP -= (e.isBoss? 6: 4);
+        // small knockback
+        const nx = (player.x - e.x)/d, ny = (player.y - e.y)/d;
+        player.x += nx*8; player.y += ny*8;
+        // remove enemy
+        const idx = enemies.indexOf(e);
+        if(idx>=0) enemies.splice(idx,1);
+        onPlayerDamaged();
+      }
+    }
+    // bosses move
+    for(const b of bosses){
+      const dx = player.x - b.x, dy = player.y - b.y;
+      const d = Math.hypot(dx,dy) || 1;
+      b.x += (dx/d) * b.speed * dt;
+      b.y += (dy/d) * b.speed * dt;
+      // touch player
+      const dist = Math.hypot(player.x - b.x, player.y - b.y);
+      if(dist < player.size/2 + b.r){
+        playerHP -= 20;
+        player.x += (player.x - b.x)/d * 10;
+        if(playerHP <= 0) { playerHP=0; onPlayerDamaged(); }
+      }
+    }
+
+    // pickups lifetime
+    for(let i = pickups.length-1; i>=0; i--){
+      const p = pickups[i];
+      // decay
+      p.life -= dt*1000;
+      if(p.life <= 0) pickups.splice(i,1);
+      else {
+        // pickup by player
+        const d = Math.hypot(player.x - p.x, player.y - p.y);
+        if(d < player.size/2 + p.size){
+          playerHP = Math.min(maxHP, playerHP + p.value);
+          pickups.splice(i,1);
+          updateUI();
+        }
+      }
+    }
+
+    // spawn enemies
+    if(now - lastSpawn > spawnInterval){
+      lastSpawn = now;
+      // spawn multiple according to difficulty
+      const count = 1 + Math.floor(Math.random()*difficulty);
+      for(let i=0;i<count;i++){ spawnEnemy(false); }
+      // boss chance: spawn when kills reach multiples of 20 (but cap duplicates)
+      if(kills>0 && kills % 20 === 0){
+        // ensure only spawn once per milestone
+        if(!bosses.some(b=>b.milestone === kills)){
+          // spawn boss
+          const b = { x: Math.random()*W, y: Math.random()*H, r: 36, hp: 200, speed: 120 * difficulty, isBoss:true, milestone:kills };
+          bosses.push(b);
+        }
+      }
+    }
+
+    // dynamic difficulty tweak: reduce speed if too many enemies
+    if(enemies.length > 40){
+      for(const e of enemies) e.speed *= 0.98;
+    }
+
+    // bullets multiplier growth
+    if(kills > 0 && Math.floor(kills/killForDouble) > Math.floor(lastDoubleAt/killForDouble)){
+      bulletsMultiplier = Math.min(64, bulletsMultiplier * 2);
+      lastDoubleAt = kills;
+      elBmul.textContent = bulletsMultiplier;
+    }
+
+    // energy: +1 per kill
+    // (we call updateUI in kill handlers)
+
+    // end game check
+    if(playerHP <= 0){
+      resetGame();
+    }
+  }
+
+  function onEnemyKilled(enemy){
+    score += 10 * difficulty;
+    kills++;
+    killsSinceSkill++;
+    energy = Math.min(maxEnergy, energy + 1);
+    // spawn pickup (healing +5) at enemy pos
+    spawnPickup(enemy.x, enemy.y);
+    updateUI();
+  }
+  function onBossKilled(boss){
+    score += 100 * difficulty;
+    kills += 5;
+    energy = Math.min(maxEnergy, energy + 5);
+    // drop bigger pickup
+    spawnPickup(boss.x, boss.y);
+    updateUI();
+  }
+  function onPlayerDamaged(){
+    updateUI();
+    // if dead -> handled in loop
+  }
+
+  function resetGame(){
+    // simple restart
+    enemies = []; bullets = []; pickups = []; bosses = [];
+    score = 0; kills = 0; energy = 0; bulletsMultiplier = 1; lastDoubleAt = 0;
+    playerHP = maxHP; player.x = W/2; player.y = H/2;
+    updateUI();
+  }
+
+  // draw
+  function draw(){
+    ctx.clearRect(0,0,W,H);
+    // background faint grid
+    ctx.fillStyle = '#050505';
+    ctx.fillRect(0,0,W,H);
+
+    // pickups
+    for(const p of pickups){
+      ctx.beginPath();
+      ctx.fillStyle = '#2ecc71';
+      ctx.arc(p.x, p.y, p.size, 0, Math.PI*2);
+      ctx.fill();
+      ctx.fillStyle = '#fff';
+      ctx.font = 'bold 12px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText('+'+p.value, p.x, p.y+4);
+    }
+
+    // bullets
+    for(const b of bullets){
+      ctx.beginPath();
+      ctx.fillStyle = b.color || '#0ff';
+      ctx.arc(b.x, b.y, 4, 0, Math.PI*2);
+      ctx.fill();
+    }
+
+    // enemies
+    for(const e of enemies){
+      ctx.beginPath();
+      ctx.fillStyle = e.color;
+      ctx.arc(e.x, e.y, e.r, 0, Math.PI*2);
+      ctx.fill();
+      // hp small bar
+      ctx.fillStyle = 'rgba(255,255,255,0.2)';
+      ctx.fillRect(e.x - e.r, e.y - e.r - 6, e.r*2, 4);
+      ctx.fillStyle = '#ff5959';
+      const hpW = Math.max(0, (e.hp / (e.isBoss?200:16)) * e.r*2);
+      ctx.fillRect(e.x - e.r, e.y - e.r - 6, hpW, 4);
+    }
+
+    // bosses
+    for(const b of bosses){
+      ctx.beginPath();
+      ctx.fillStyle = '#b00000';
+      ctx.arc(b.x, b.y, b.r, 0, Math.PI*2);
+      ctx.fill();
+      // big HP bar
+      ctx.fillStyle = 'rgba(255,255,255,0.12)';
+      ctx.fillRect(b.x - b.r, b.y - b.r - 10, b.r*2, 6);
+      ctx.fillStyle = '#ffb3b3';
+      const w = Math.max(0, (b.hp/200) * b.r*2);
+      ctx.fillRect(b.x - b.r, b.y - b.r - 10, w, 6);
+      ctx.fillStyle='#fff';
+      ctx.font='12px sans-serif';
+      ctx.textAlign='center';
+      ctx.fillText('Boss ' + Math.max(0,Math.round(b.hp)), b.x, b.y - b.r - 14);
+    }
+
+    // player
+    ctx.save();
+    ctx.translate(player.x, player.y);
+    ctx.fillStyle = '#0ff';
+    // player as square
+    ctx.fillRect(-player.size/2, -player.size/2, player.size, player.size);
+    ctx.restore();
+
+    // HUD text minimal (we show full in DOM)
+    ctx.fillStyle = 'rgba(255,255,255,0.06)';
+    ctx.fillRect(0,0,200,100);
+
+    // Done
+  }
+
+  // update UI DOM
+  function updateUI(){
+    elScore.textContent = score;
+    elKills.textContent = kills;
+    elEnergy.textContent = energy;
+    elHP.textContent = Math.max(0, Math.round(playerHP));
+    elBmul.textContent = bulletsMultiplier;
+    const pct = Math.max(0, Math.min(1, playerHP / maxHP));
+    elHPFill.style.width = (pct*100) + '%';
+  }
+
+  // main loop
+  function loop(t){
+    const now = t;
+    const dt = Math.min(0.05, (now - lastTime)/1000);
+    update(dt);
+    draw();
+    lastTime = now;
+    requestAnimationFrame(loop);
+  }
+
+  // initial spawn few enemies
+  for(let i=0;i<6;i++) spawnEnemy();
+  updateUI();
+  requestAnimationFrame(loop);
+
+  /* ---- extras: allow clicking/touch to aim-fire when not using joystick ---- */
+  window.addEventListener('click', (e)=>{
+    // if click inside fire button region ignore
+    const br = btnFire.getBoundingClientRect();
+    const sr = btnSkill.getBoundingClientRect();
+    if(e.clientX > br.left && e.clientX < br.right && e.clientY > br.top && e.clientY < br.bottom) return;
+    if(e.clientX > sr.left && e.clientX < sr.right && e.clientY > sr.top && e.clientY < sr.bottom) return;
+    // else fire at click position
+    fireAt(e.clientX, e.clientY);
+  });
+
+  // allow keyboard arrows & space for desktop testing
+  const keys = {};
+  window.addEventListener('keydown', e=>{
+    keys[e.key] = true;
+    if(e.key === ' ') { firing = true; }
+  });
+  window.addEventListener('keyup', e=>{
+    keys[e.key] = false;
+    if(e.key === ' ') { firing = false; }
+  });
+  // update movement from keys (simple)
+  setInterval(()=>{ 
+    const kd = keys;
+    let mx=0,my=0;
+    if(kd.ArrowLeft||kd.a) mx=-1;
+    if(kd.ArrowRight||kd.d) mx=1;
+    if(kd.ArrowUp||kd.w) my=-1;
+    if(kd.ArrowDown||kd.s) my=1;
+    const mlen = Math.hypot(mx,my)||1;
+    moveDir.x = mx/mlen;
+    moveDir.y = my/mlen;
+  }, 30);
+
+  // expose some debug helpers in console (optional)
+  window.GAME = { enemies, bullets, player, spawnEnemy, spawnPickup, resetGame, useSkill };
+
+})();
+</script>
+</body>
+  </html>
